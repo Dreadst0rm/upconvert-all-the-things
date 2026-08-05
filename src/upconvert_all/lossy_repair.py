@@ -1,0 +1,302 @@
+"""Repair lossy-encoded audio (MP3/AAC/etc.) toward a cleaner 24-bit FLAC listen.
+
+This cannot restore a discarded studio master. It reduces common codec artifacts
+and synthesizes plausible high-frequency content (bandwidth extension) so many
+poor encodes sound closer to a clean lossless file for casual listening.
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Literal
+
+import numpy as np
+from scipy import signal
+
+from .ml_upscaler import ml_available
+
+SAMPLE_RATE = 44100
+ProgressCb = Callable[[str, float], None]
+Strength = Literal["light", "medium", "strong"]
+
+LOSSY_SUFFIXES = {
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".wma",
+    ".opus",
+    ".ogg",
+    ".oga",
+}
+
+STRENGTH_PARAMS = {
+    # (artifact_suppress, bwe_gain, hf_tilt, stereo_widen)
+    # Tuned for a clearer restored/open sound vs the source encode.
+    "light": (0.45, 0.70, 0.60, 0.10),
+    "medium": (0.70, 1.05, 0.78, 0.18),
+    "strong": (0.90, 1.35, 0.92, 0.28),
+}
+
+# Blend repaired HF residual into the dry signal (audible lift).
+_BLEND = {"light": 0.55, "medium": 0.78, "strong": 0.95}
+
+
+def _hp_resid_ba(sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    nyq = max(float(sample_rate) / 2.0, 1.0)
+    cutoff = min(3200.0, nyq * 0.85)
+    return signal.butter(2, cutoff / nyq, btype="high")
+
+
+def is_likely_lossy(path_suffix: str) -> bool:
+    return path_suffix.lower() in LOSSY_SUFFIXES
+
+
+def repair_backend(*, prefer_torch: bool = True) -> str:
+    if prefer_torch and ml_available():
+        return "spectral+torch-refine"
+    return "spectral-bwe"
+
+
+def _estimate_cutoff_hz(
+    freqs: np.ndarray, mag: np.ndarray, *, sample_rate: int
+) -> float:
+    """Estimate codec bandwidth limit from average magnitude envelope."""
+    env = np.maximum(mag.mean(axis=1), 1e-12)
+    # Smooth in log-ish frequency bins
+    kernel = np.ones(5) / 5.0
+    smooth = np.convolve(env, kernel, mode="same")
+    peak = float(np.max(smooth)) + 1e-12
+    # Cutoff: last bin still within -40 dB of peak, scanning from high freqs down
+    thresh = peak * (10 ** (-40 / 20))
+    cutoff_bin = 1
+    for i in range(len(smooth) - 2, 0, -1):
+        if smooth[i] >= thresh and freqs[i] > 3000:
+            cutoff_bin = i
+            break
+    # Typical MP3 walls ~15–18 kHz; clamp below Nyquist
+    nyq = float(sample_rate) / 2.0
+    hz = float(freqs[cutoff_bin])
+    hi = min(19000.0, nyq * 0.98)
+    lo = min(8000.0, hi * 0.75)
+    return float(np.clip(hz, lo, hi))
+
+
+def _suppress_codec_artifacts(
+    z: np.ndarray,
+    freqs: np.ndarray,
+    cutoff_hz: float,
+    strength: float,
+) -> np.ndarray:
+    """Soften unstable high-band bins typical of lossy coding."""
+    hf = freqs >= max(6000.0, cutoff_hz * 0.75)
+    if not np.any(hf):
+        return z
+    mag = np.abs(z)
+    phase = np.angle(z)
+    # Temporal smooth only on HF rows (avoid full-spectrogram rolls)
+    m_hf = mag[hf, :]
+    left = np.empty_like(m_hf)
+    right = np.empty_like(m_hf)
+    left[:, 0] = m_hf[:, -1]
+    left[:, 1:] = m_hf[:, :-1]
+    right[:, -1] = m_hf[:, 0]
+    right[:, :-1] = m_hf[:, 1:]
+    avg = (left + m_hf + right) / 3.0
+    jump = np.abs(m_hf - avg) / (avg + 1e-9)
+    damp = 1.0 / (1.0 + strength * 2.5 * jump)
+    mag = mag.copy()
+    mag[hf, :] = (1.0 - strength) * m_hf + strength * avg * damp
+    return mag * np.exp(1j * phase)
+
+
+def _tile_rows(src: np.ndarray, n_dst: int) -> np.ndarray:
+    """Repeat rows of src to length n_dst without allocating a full np.tile buffer."""
+    src_len = src.shape[0]
+    if src_len == 0 or n_dst <= 0:
+        return np.empty((0, src.shape[1]), dtype=src.dtype)
+    rows = np.arange(n_dst) % src_len
+    return src[rows]
+
+
+def _bandwidth_extend(
+    z: np.ndarray,
+    freqs: np.ndarray,
+    cutoff_hz: float,
+    *,
+    bwe_gain: float,
+    hf_tilt: float,
+) -> np.ndarray:
+    """Mirror mid/high band into missing HF with decaying envelope."""
+    mag = np.abs(z)
+    phase = np.angle(z)
+    n_freq, _n_frames = mag.shape
+    # Source band just below cutoff
+    src_hi = int(np.searchsorted(freqs, cutoff_hz))
+    src_hi = int(np.clip(src_hi, 8, n_freq - 2))
+    src_lo = int(np.clip(src_hi - max(8, src_hi // 3), 1, src_hi - 1))
+    src = mag[src_lo:src_hi, :]
+    if src.size == 0:
+        return z
+
+    # Destination: above cutoff to Nyquist
+    dst_lo = src_hi
+    dst_hi = n_freq
+    n_dst = dst_hi - dst_lo
+    if n_dst <= 1:
+        return z
+
+    mirrored = np.flipud(src)
+    fill = _tile_rows(mirrored, n_dst)
+
+    # Envelope decay toward Nyquist
+    decay = np.linspace(1.0, max(0.05, 1.0 - hf_tilt), n_dst).reshape(-1, 1)
+    # Match level at cutoff seam
+    seam = np.maximum(mag[src_hi - 1 : src_hi, :], 1e-9)
+    scale = (seam / np.maximum(fill[:1, :], 1e-9)) * bwe_gain
+    fill = fill * scale * decay
+
+    # Keep a little of any existing HF, blend in extension
+    existing = mag[dst_lo:dst_hi, :]
+    mag[dst_lo:dst_hi, :] = np.maximum(existing * 0.25, fill)
+
+    # Phase: continue with randomized but stable HF phase from source mirror
+    rng = np.random.default_rng(0xB10E)
+    phase_fill = np.flipud(phase[src_lo:src_hi, :])
+    pfill = _tile_rows(phase_fill, n_dst)
+    pfill = pfill + rng.uniform(-0.35, 0.35, size=pfill.shape)
+    # Preserve existing phase where energy already existed
+    use_exist = existing > (fill * 0.5)
+    phase[dst_lo:dst_hi, :] = np.where(use_exist, phase[dst_lo:dst_hi, :], pfill)
+
+    return mag * np.exp(1j * phase)
+
+
+def _stereo_widen(left: np.ndarray, right: np.ndarray, amount: float) -> tuple[np.ndarray, np.ndarray]:
+    """Mild M/S widen to counteract joint-stereo collapse."""
+    mid = 0.5 * (left + right)
+    side = 0.5 * (left - right)
+    side = side * (1.0 + amount)
+    l = mid + side
+    r = mid - side
+    peak = max(np.max(np.abs(l)), np.max(np.abs(r)), 1e-12)
+    if peak > 0.98:
+        g = 0.98 / peak
+        l *= g
+        r *= g
+    return l, r
+
+
+def _torch_hf_refine(x: np.ndarray, *, sample_rate: int) -> np.ndarray:
+    """Optional light residual refine (reuses ML upscaler net scaled up)."""
+    from .ml_upscaler import apply_ml_upscaler
+
+    # apply_ml_upscaler adds sub-LSB residual; scale up for audible HF polish
+    y = apply_ml_upscaler(x, prefer_torch=True, sample_rate=sample_rate)
+    resid = y - x
+    return np.clip(x + resid * 220.0, -1.0, 1.0)
+
+
+def repair_channel(
+    x: np.ndarray,
+    *,
+    strength: Strength = "medium",
+    use_torch: bool = True,
+    sample_rate: int = SAMPLE_RATE,
+) -> np.ndarray:
+    """Repair one float channel in [-1, 1]."""
+    x = np.asarray(x, dtype=np.float64).ravel()
+    n = x.size
+    sr = int(sample_rate)
+    art, bwe_gain, hf_tilt, _widen = STRENGTH_PARAMS[strength]
+
+    nperseg = min(4096, max(256, n // 2 * 2))  # even, fit short clips
+    noverlap = min(nperseg - 1, (nperseg * 3) // 4)
+    freqs, _times, z = signal.stft(
+        x, fs=sr, nperseg=nperseg, noverlap=noverlap, boundary="zeros"
+    )
+    cutoff = _estimate_cutoff_hz(freqs, np.abs(z), sample_rate=sr)
+    z = _suppress_codec_artifacts(z, freqs, cutoff, art)
+    z = _bandwidth_extend(z, freqs, cutoff, bwe_gain=bwe_gain, hf_tilt=hf_tilt)
+    _, y = signal.istft(z, fs=sr, nperseg=nperseg, noverlap=noverlap, boundary=True)
+    if y.size < n:
+        y = np.pad(y, (0, n - y.size))
+    else:
+        y = y[:n]
+
+    # Apply a light presence shelf on the repaired residual before blend
+    # so restored top-end is more audible without crushing the midrange body.
+    b, a = _hp_resid_ba(sr)
+    resid = signal.filtfilt(b, a, y - x)
+    # Extra HF emphasis on the residual (2–3 dB-ish toward Nyquist)
+    n = resid.size
+    if n > 32:
+        # one-pole shelf approximation via pre-emphasis
+        resid = resid + 0.22 * np.diff(resid, prepend=resid[:1])
+
+    blend = _BLEND[strength]
+    out = np.clip(x + blend * resid, -1.0, 1.0)
+
+    if use_torch and ml_available():
+        out = _torch_hf_refine(out, sample_rate=sr)
+    return out
+
+
+def repair_lossy_pcm(
+    pcm: np.ndarray,
+    *,
+    strength: Strength = "medium",
+    use_torch: bool = True,
+    sample_rate: int = SAMPLE_RATE,
+    progress: ProgressCb | None = None,
+) -> np.ndarray:
+    """Repair int16 stereo/mono PCM; returns int16 same shape."""
+    if strength not in STRENGTH_PARAMS:
+        raise ValueError(f"strength must be one of {tuple(STRENGTH_PARAMS)}")
+
+    arr = np.asarray(pcm)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    float_x = arr.astype(np.float64) / 32768.0
+    n_ch = float_x.shape[1]
+    outs = []
+    _, _, _, widen = STRENGTH_PARAMS[strength]
+
+    for c in range(n_ch):
+        if progress:
+            progress(f"lossy repair ch{c + 1}/{n_ch}", 0.15 + 0.2 * (c / max(n_ch, 1)))
+        outs.append(
+            repair_channel(
+                float_x[:, c],
+                strength=strength,
+                use_torch=use_torch,
+                sample_rate=sample_rate,
+            )
+        )
+
+    if n_ch >= 2 and widen > 0:
+        outs[0], outs[1] = _stereo_widen(outs[0], outs[1], widen)
+
+    stacked = np.column_stack(outs) if n_ch > 1 else outs[0].reshape(-1, 1)
+    # Match original channel count / layout
+    if pcm.ndim == 1:
+        stacked = stacked[:, 0]
+    elif stacked.shape[1] > pcm.shape[1]:
+        stacked = stacked[:, : pcm.shape[1]]
+
+    peak = np.max(np.abs(stacked)) + 1e-12
+    if peak > 0.99:
+        stacked = stacked * (0.99 / peak)
+
+    out_i16 = np.round(np.clip(stacked, -1.0, 1.0 - 1.0 / 32768.0) * 32768.0).astype(
+        np.int16
+    )
+    if progress:
+        progress("lossy repair done", 0.38)
+    return np.ascontiguousarray(out_i16)
+
+
+def repair_description(strength: Strength, backend: str) -> str:
+    return (
+        f"UpConvert lossy repair ({strength}): codec artifact cleanup + bandwidth "
+        f"extension ({backend}). Approximate enhancement from a lossy source — "
+        f"not a studio master or CD-quality archive."
+    )

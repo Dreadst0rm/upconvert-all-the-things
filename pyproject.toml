@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "upconvert-all-the-things"
+version = "0.1.0"
+description = "Repair broken video / lossy audio, then selectively upconvert to lossless containers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "UpConvert All" }]
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "soundfile>=0.12",
+  "mutagen>=1.47",
+  "PySide6>=6.6",
+  "numba>=0.59",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+ml = ["torch>=2.1"]
+
+[project.scripts]
+upconvert-all = "upconvert_all.cli:main"
+upconvert-all-gui = "upconvert_all.gui:run_gui_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

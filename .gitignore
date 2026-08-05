@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets / local config (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+credentials.json
+**/secrets.json
+**/credentials*.json
+.local/
+*.local.toml
+*.local.yaml
+*.local.yml
+*.local.json
+config.local.*
+settings.local.*
+
+# Default and ad-hoc process output folders
+output/
+*_out/
+*_out2/
+out/
+outs/
+delivery/
+
+# Generated media / masters (keep fixtures if added under tests/)
+*.flac
+*.mkv
+*.wav
+*.m4a
+*.delivery.mp4
+!tests/fixtures/**
+
+# Logs / debug dumps
+*.log
+debug-*.log
+*.convert.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
