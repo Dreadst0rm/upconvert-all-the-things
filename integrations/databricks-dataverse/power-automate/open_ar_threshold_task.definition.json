@@ -1,0 +1,137 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "comment": "Reference definition for Open AR threshold → native Task. Adjust entity set names to your VT schema. No Databricks writes.",
+  "pattern": "crm_serve_read_native_write",
+  "parameters": {
+    "OpenArThreshold": {
+      "type": "number",
+      "default": 10000,
+      "description": "Create a Task when open_ar_balance is greater than or equal to this value."
+    },
+    "TaskSubjectPrefix": {
+      "type": "string",
+      "default": "Open AR review"
+    },
+    "AccountOrderSummaryEntitySet": {
+      "type": "string",
+      "default": "new_accountordersummaries",
+      "description": "Plural logical name of the virtual table for account_order_summary."
+    },
+    "ErpCustomerAttribute": {
+      "type": "string",
+      "default": "new_erp_customer_id"
+    }
+  },
+  "triggers": {
+    "Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Day",
+        "interval": 1,
+        "schedule": {
+          "hours": [7],
+          "minutes": [0]
+        }
+      }
+    }
+  },
+  "actions": {
+    "Compose_OpenArThreshold": {
+      "type": "Compose",
+      "inputs": "@parameters('OpenArThreshold')"
+    },
+    "List_Accounts_With_Erp_Key": {
+      "type": "OpenApiConnection",
+      "inputs": {
+        "host": {
+          "connectionName": "shared_commondataserviceforapps",
+          "operationId": "ListRecords"
+        },
+        "parameters": {
+          "entityName": "accounts",
+          "$select": "accountid,name,new_erp_customer_id",
+          "$filter": "new_erp_customer_id ne null"
+        }
+      },
+      "runAfter": {
+        "Compose_OpenArThreshold": ["Succeeded"]
+      }
+    },
+    "Apply_to_each_Account": {
+      "type": "Foreach",
+      "foreach": "@outputs('List_Accounts_With_Erp_Key')?['body/value']",
+      "actions": {
+        "List_Account_Order_Summary": {
+          "type": "OpenApiConnection",
+          "inputs": {
+            "host": {
+              "connectionName": "shared_commondataserviceforapps",
+              "operationId": "ListRecords"
+            },
+            "parameters": {
+              "entityName": "@parameters('AccountOrderSummaryEntitySet')",
+              "$select": "customer_id,customer_name,ltm_revenue,open_order_count,last_order_date,open_ar_balance,as_of_ts",
+              "$filter": "customer_id eq '@{items('Apply_to_each_Account')?['new_erp_customer_id']}'",
+              "$top": 1
+            }
+          }
+        },
+        "Condition_OpenAr_Over_Threshold": {
+          "type": "If",
+          "expression": {
+            "and": [
+              {
+                "greaterOrEquals": [
+                  "@float(coalesce(first(body('List_Account_Order_Summary')?['value'])?['open_ar_balance'], 0))",
+                  "@float(outputs('Compose_OpenArThreshold'))"
+                ]
+              }
+            ]
+          },
+          "actions": {
+            "Create_Task": {
+              "type": "OpenApiConnection",
+              "inputs": {
+                "host": {
+                  "connectionName": "shared_commondataserviceforapps",
+                  "operationId": "CreateRecord"
+                },
+                "parameters": {
+                  "entityName": "tasks",
+                  "item/subject": "@{parameters('TaskSubjectPrefix')}: @{items('Apply_to_each_Account')?['name']} (@{first(body('List_Account_Order_Summary')?['value'])?['open_ar_balance']})",
+                  "item/description": "Open AR @{first(body('List_Account_Order_Summary')?['value'])?['open_ar_balance']}\nLTM revenue @{first(body('List_Account_Order_Summary')?['value'])?['ltm_revenue']}\nOpen orders @{first(body('List_Account_Order_Summary')?['value'])?['open_order_count']}\nLast order @{first(body('List_Account_Order_Summary')?['value'])?['last_order_date']}\nAs of @{first(body('List_Account_Order_Summary')?['value'])?['as_of_ts']}\nSource: crm_serve.account_order_summary (read-only).",
+                  "item/regardingobjectid_account@odata.bind": "/accounts(@{items('Apply_to_each_Account')?['accountid']})"
+                }
+              },
+              "description": "NATIVE WRITE ONLY — tasks entity. Do not add Databricks write actions."
+            }
+          },
+          "else": {
+            "actions": {}
+          },
+          "runAfter": {
+            "List_Account_Order_Summary": ["Succeeded"]
+          }
+        }
+      },
+      "runAfter": {
+        "List_Accounts_With_Erp_Key": ["Succeeded"]
+      }
+    }
+  },
+  "outputs": {},
+  "constraints": {
+    "allowedWriteEntities": ["tasks"],
+    "forbiddenActions": [
+      "Databricks.ExecuteSqlWrite",
+      "Databricks.Merge",
+      "Databricks.Insert",
+      "Databricks.Update",
+      "Databricks.Delete"
+    ],
+    "readSources": [
+      "accounts",
+      "crm_serve.account_order_summary via Dataverse virtual table"
+    ]
+  }
+}

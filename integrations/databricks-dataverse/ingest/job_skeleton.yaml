@@ -1,0 +1,25 @@
+# Job skeleton — Dataverse CRM → gold dim
+
+Schedule after Synapse Link / Lakeflow lands bronze Account data.
+
+```yaml
+name: crm-account-medallion
+schedule: "0 * * * *"  # hourly; aligns with ≤4h enrichment SLA when combined with link lag
+tasks:
+  - task_key: silver_crm_account
+    sql_file: ingest/sql/02_silver_crm_account.sql
+    parameters:
+      catalog: ${catalog}
+  - task_key: merge_dim_crm_account
+    depends_on: [silver_crm_account]
+    sql_file: ingest/sql/03_merge_dim_crm_account.sql
+    parameters:
+      catalog: ${catalog}
+  - task_key: refresh_crm_serve
+    depends_on: [merge_dim_crm_account]
+    sql_file: sql/08_refresh_mvs.sql
+    parameters:
+      catalog: ${catalog}
+```
+
+Apply placeholders with `sql/apply_placeholders.sh` before uploading SQL task bodies, or use Databricks job parameters / widgets named `catalog`.

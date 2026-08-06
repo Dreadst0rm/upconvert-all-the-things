@@ -9,6 +9,8 @@ User-facing options live in the [main README](../README.md). These notes explain
 | [Audio enhance](audio-enhance.md) | Perceptual EQ / image / immersion |
 | [Video repair & enhance](video-repair-enhance.md) | ffmpeg repair, FFV1, sync, denoise |
 
+Related integration package (Databricks gold → Dataverse CRM serving): [../integrations/databricks-dataverse/README.md](../integrations/databricks-dataverse/README.md).
+
 ## Mental model
 
 ```text
