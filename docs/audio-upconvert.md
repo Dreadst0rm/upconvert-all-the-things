@@ -25,7 +25,7 @@ int16 PCM
 1. Treat each sample as living in a quantization interval of width 1 LSB at 16-bit.
 2. Maintain a high-precision float estimate consistent with that interval (**SBM-consistent projection**).
 3. Apply mild temporal smoothness and optional **prefer** prior (spectral residual or Torch net) that nudges the residual toward richer HF detail — still constrained to the bin.
-4. Repeat for `--upconvert-iterations` (GUI: **Iterations**).
+4. Repeat for `--upconvert-iterations` (GUI advanced: **Expand iterations**).
 
 Numba accelerates hot loops when available.
 

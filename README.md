@@ -90,19 +90,19 @@ Boolean flags use `--flag` / `--no-flag`. With `--preset`, an explicit flag stil
 |--------------|-----|----------------|
 | `--repair-audio` / `--no-…` | Repair audio | Spectral cleanup + bandwidth extension + mild M/S widen on lossy encodes. Does not restore discarded master data. |
 | `--repair-video` / `--no-…` | Repair video | ffmpeg best-effort: genpts, drop corrupt packets, remux; re-encode fallback. Cannot restore deleted frames. |
-| `--upconvert-audio` / `--no-…` | Upconvert audio | Expand toward 20/24-bit with SBM-style synthesis + dither. Approximate detail only. |
-| `--upconvert-video` / `--no-…` | Upconvert video (FFV1) | Re-encode video as lossless FFV1 (MKV) or near-lossless H.264 CRF 0 (MP4). Off = stream-copy when possible. |
-| `--repair-strength` `light\|medium\|strong` | Strength | How aggressive lossy-audio repair is (artifact suppress, BWE, widen). |
-| `--bits` `20\|24` | Bits | Target bit depth for upconverted audio (packed in FLAC/WAV). |
-| `--ml-upscaler` / `--no-…` | ML upscaler | Spectral/ML preference prior during expand. Needs PyTorch (`pip install -e ".[ml]"`); GUI disables the box if missing. Falls back to analytic expand. |
-| `--upconvert-iterations` / `--expand-iterations` | Iterations | Projection iterations for expand (higher = smoother / more refined, slower). |
-| `--dither` `sbm\|tpdf\|none` | Dither | Final quantize dither: SBM noise-shaped TPDF (default), flat TPDF, or none. |
-| `--native-sample-rate` / `--no-…` | Native sample rate | Keep source rate (e.g. 48 kHz). `--no-native-sample-rate` forces 44.1 kHz. |
+| `--upconvert-audio` / `--no-…` | Upconvert audio (20/24-bit) | Expand toward 20/24-bit with SBM-style synthesis + dither. Approximate detail only. |
+| `--upconvert-video` / `--no-…` | Re-encode video losslessly | Re-encode video as lossless FFV1 (MKV) or near-lossless H.264 CRF 0 (MP4). Off = stream-copy when possible. |
+| `--repair-strength` `light\|medium\|strong` | Strength (advanced) | How aggressive lossy-audio repair is (artifact suppress, BWE, widen). |
+| `--bits` `20\|24` | Bit depth (advanced) | Target bit depth for upconverted audio (packed in FLAC/WAV). |
+| `--ml-upscaler` / `--no-…` | Richer detail (optional ML) | Spectral/ML preference prior during expand. Needs PyTorch (`pip install -e ".[ml]"`); GUI disables the box if missing. Falls back to analytic expand. |
+| `--upconvert-iterations` / `--expand-iterations` | Expand iterations (advanced) | Projection iterations for expand (higher = smoother / more refined, slower). |
+| `--dither` `sbm\|tpdf\|none` | Dither (advanced) | Final quantize dither: SBM noise-shaped TPDF (default), flat TPDF, or none. |
+| `--native-sample-rate` / `--no-…` | Keep source sample rate (advanced) | Keep source rate (e.g. 48 kHz). `--no-native-sample-rate` forces 44.1 kHz. |
 | `--container` `mkv\|mp4\|flac` | Container | Output container for video jobs (MKV recommended for FFV1+FLAC). |
-| `--flac-level` `0–8` | FLAC level | Compression only; does not change sound. |
+| `--flac-level` `0–8` | FLAC compression (advanced) | Compression only; does not change sound. |
 | `--ffmpeg` | — | Force ffmpeg decode for audio. |
-| `--compress-mp4` / `--no-…` | Post-compress MP4 | After master, write delivery MP4/M4A. |
-| `--compress-quality` | MP4 quality | See [Post-compress](#post-compress-mp4). |
+| `--compress-mp4` / `--no-…` | Also write a smaller delivery MP4 | After master, write delivery MP4/M4A. |
+| `--compress-quality` | Delivery quality (advanced) | See [Post-compress](#post-compress-mp4). |
 | `--keep-master` / `--no-…` | — | Keep lossless/master beside delivery (default on). |
 
 ### Enhance (perceptual)
@@ -111,17 +111,17 @@ Enhance runs **after** repair/upconvert. Off entirely when `enhance_audio` / `en
 
 | Option (CLI) | GUI | What it does |
 |--------------|-----|----------------|
-| `--enhance-audio` / `--no-…` | Enhance audio | Enable the listening enhance chain (EQ → image → immersion → crossfeed → true-peak ceiling). |
-| `--eq-mode` `none\|auto-clarity\|target-curve` | EQ mode | `auto-clarity`: mild mid scoop / presence from band energy. `target-curve`: gentle shelves. |
-| `--eq-curve` `flat\|harman\|diffuse-field\|equal-loudness\|warm\|analytical\|vocal-presence\|small-speaker` | EQ curve | Multi-band inspired targets when `eq-mode=target-curve` (not calibrated lab curves). |
-| `--stereo-image` `0–100` | Stereo image | M/S reshape + ambience; speaker mode adds mild crosstalk cancel (XTC). 0 = off. |
-| `--stereo-image-mode` `speaker\|headphone` | Image mode | Speaker = mild XTC; headphone = width + light presence shelf (no XTC). |
-| `--immersion` `off\|binaural\|speaker-wide` | Immersion | WFS-**inspired** stage (ITD/ILD + early reflections / widen). Stereo/binaural only — **not** true WFS. |
-| `--immersion-depth` `0–1` | Immersion depth | How deep the virtual stage / reflections feel. |
-| `--crossfeed` / `--no-…` | Crossfeed | Bauer-style lowpassed headphone crossfeed. |
+| `--enhance-audio` / `--no-…` | Enhance audio (listening) | Enable the listening enhance chain (EQ → image → immersion → crossfeed → true-peak ceiling). |
+| `--eq-mode` `none\|auto-clarity\|target-curve` | EQ (advanced) | `auto-clarity`: mild mid scoop / presence from band energy. `target-curve`: gentle shelves. |
+| `--eq-curve` `flat\|harman\|diffuse-field\|equal-loudness\|warm\|analytical\|vocal-presence\|small-speaker` | EQ curve (advanced) | Multi-band inspired targets when `eq-mode=target-curve` (not calibrated lab curves). |
+| `--stereo-image` `0–100` | Stereo width (advanced) | M/S reshape + ambience; speaker mode adds mild crosstalk cancel (XTC). 0 = off. |
+| `--stereo-image-mode` `speaker\|headphone` | Playback (advanced) | Speakers = mild XTC; headphones = width + light presence shelf (no XTC). |
+| `--immersion` `off\|binaural\|speaker-wide` | Immersion (advanced) | WFS-**inspired** stage (ITD/ILD + early reflections / widen). Stereo/binaural only — **not** true WFS. |
+| `--immersion-depth` `0–1` | Stage depth (advanced) | How deep the virtual stage / reflections feel (GUI uses 0–100%). |
+| `--crossfeed` / `--no-…` | Headphone crossfeed (advanced) | Bauer-style lowpassed headphone crossfeed. |
 | `--enhance-video` / `--no-…` | Enhance video | Gate for video enhance filters below. |
-| `--video-sync-tighten` / `--no-…` | A/V sync tighten | `aresample=async` to reduce A/V drift (requires enhance video). |
-| `--video-denoise` / `--no-…` | Video denoise | Light `hqdn3d` (requires enhance video; forces video re-encode if copy was planned). |
+| `--video-sync-tighten` / `--no-…` | Tighten A/V sync (advanced) | `aresample=async` to reduce A/V drift (requires enhance video). |
+| `--video-denoise` / `--no-…` | Light video denoise (advanced) | Light `hqdn3d` (requires enhance video; forces video re-encode if copy was planned). |
 
 When enhance audio is active, a **true-peak style ceiling** (~−0.5 dBTP via 4× peak estimate) is applied so masters are less likely to clip after processing.
 
@@ -152,10 +152,12 @@ upconvert-all process track.flac -o .\out --no-repair-audio --no-upconvert-audio
 
 ## GUI
 
-- **Presets** combo + Custom when you tweak anything
-- Checkboxes and spin/combo controls match the tables above (tooltips on hover)
+- **Presets** combo with a one-line intent description; switches to Custom when you tweak anything
+- **What will happen** recap of the current pipeline (repair → upconvert → enhance → write)
+- Simple by default: stage checkboxes + container. **Show advanced settings** reveals nested knobs
+- Checkboxes and spin/combo controls match the tables above (plain-language labels; tooltips on hover)
 - **A/B Preview** — ~15s mid clip with current audio repair/upconvert/**enhance** settings; Source ↔ Processed
-- **ML upscaler** — unchecked and disabled if PyTorch is not installed
+- **Richer detail (optional ML)** — unchecked and disabled if PyTorch is not installed
 - Window reflows for narrow/short sizes
 
 ## Documentation
