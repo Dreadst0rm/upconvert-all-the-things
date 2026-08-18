@@ -8,13 +8,12 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -28,14 +27,16 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .formats import ALL_SUFFIXES, collect_inputs
 from .enhance import list_eq_curves
+from .formats import ALL_SUFFIXES, collect_inputs
 from .ml_upscaler import ml_available
 from .pipeline import ProcessOptions, build_ab_preview, process_file
+from .pipeline_summary import queue_media_kinds, summarize_pipeline
 from .presets import (
     CUSTOM_ID,
     DEFAULT_PRESET,
@@ -56,6 +57,20 @@ HONESTY = (
 HONESTY_SHORT = (
     "Best-effort only — not a studio master. Enhance is perceptual sweetening, not WFS."
 )
+
+_EQ_CURVE_LABELS = {
+    "flat": "Flat (no target)",
+    "harman": "Harman-inspired",
+    "diffuse-field": "Diffuse-field inspired",
+    "equal-loudness": "Equal-loudness inspired",
+    "warm": "Warm",
+    "analytical": "Analytical",
+    "vocal-presence": "Vocal presence",
+    "small-speaker": "Small speaker",
+}
+
+_SETTINGS_ORG = "UpConvertAll"
+_SETTINGS_APP = "UpConvertAllTheThings"
 
 
 class Worker(QObject):
@@ -144,8 +159,8 @@ def _labeled_row(label: str, widget: QWidget, tooltip: str | None = None) -> QWi
     lay.setContentsMargins(0, 0, 0, 0)
     lay.setSpacing(6)
     lab = QLabel(label)
-    lab.setMinimumWidth(88)
-    lab.setMaximumWidth(110)
+    lab.setMinimumWidth(128)
+    lab.setMaximumWidth(168)
     lay.addWidget(lab)
     widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     lay.addWidget(widget, stretch=1)
@@ -165,10 +180,52 @@ def _make_group(title: str) -> tuple[QGroupBox, QVBoxLayout]:
     return box, lay
 
 
-# Short hover help for options controls.
+def _make_nested() -> tuple[QWidget, QVBoxLayout]:
+    wrap = QWidget()
+    lay = QVBoxLayout(wrap)
+    lay.setContentsMargins(18, 2, 0, 2)
+    lay.setSpacing(4)
+    return wrap, lay
+
+
+def _fill_combo(
+    combo: QComboBox,
+    items: list[tuple[str, object]],
+    *,
+    tips: dict | None = None,
+) -> None:
+    combo.clear()
+    for label, data in items:
+        combo.addItem(label, data)
+        if tips and data in tips:
+            combo.setItemData(
+                combo.count() - 1,
+                tips[data],
+                Qt.ItemDataRole.ToolTipRole,
+            )
+
+
+def _set_combo_data(combo: QComboBox, value: object) -> None:
+    idx = combo.findData(value)
+    if idx < 0 and value is not None:
+        idx = combo.findData(str(value))
+    if idx < 0 and isinstance(value, str):
+        try:
+            idx = combo.findData(int(value))
+        except ValueError:
+            pass
+    if idx >= 0:
+        combo.setCurrentIndex(idx)
+
+
+# Hover help for option controls.
 _TIP_PRESET = (
     "Named settings packs (Listen better, Rescue video, Archive remux, Master MKV, "
     "Immersive listen). Tweaking any control switches to Custom."
+)
+_TIP_ADVANCED = (
+    "Show extra knobs (repair strength, bit depth, EQ curve, dither, and so on). "
+    "Presets still fill these in when hidden."
 )
 _TIP_REPAIR_A = (
     "Clean up lossy-audio artifacts (MP3/AAC/etc.) with spectral repair + bandwidth "
@@ -187,11 +244,12 @@ _TIP_UP_V = (
     "Off = stream-copy video when possible."
 )
 _TIP_ML = (
-    "Use the optional ML/spectral preference prior during audio upconvert for slightly "
-    "richer residual detail. Falls back to analytic expand if ML is unavailable."
+    "Slightly richer residual detail during audio upconvert (optional ML/spectral "
+    "preference). Falls back to analytic expand if ML is unavailable."
 )
 _TIP_ML_UNAVAILABLE = (
-    "ML upscaler requires PyTorch. Install with: python -m pip install -e \".[ml]\""
+    "Richer detail (optional ML) requires PyTorch. Install with: "
+    'python -m pip install -e ".[ml]"'
 )
 _TIP_COMPRESS = (
     "After writing the master, also make a smaller delivery MP4/M4A (H.264 + ALAC/AAC). "
@@ -210,14 +268,17 @@ _TIP_ITERS = (
     "Upconvert projection iterations. Higher = smoother / more refined detail, slower."
 )
 _TIP_DITHER = (
-    "Final quantize dither: SBM (noise-shaped TPDF, default), flat TPDF, or none."
+    "Final quantize dither: SBM (noise-shaped TPDF, recommended), flat TPDF, or none."
 )
 _TIP_CONTAINER = (
-    "Output container for video jobs: MKV (FFV1/FLAC friendly) or MP4 (broader player support)."
+    "Output container for video jobs: MKV (best for lossless FFV1/FLAC) or MP4 "
+    "(broader player support)."
 )
-_TIP_FLAC = "FLAC compression level 0–8 (higher = smaller file, slower encode). Does not change sound."
+_TIP_FLAC = (
+    "FLAC compression 0–8 (higher = smaller file, slower encode). Does not change sound."
+)
 _TIP_MP4Q = (
-    "Delivery encode quality when Post-compress MP4 is on: "
+    "Delivery encode quality when a smaller MP4 is also written: "
     "transparent (CRF 15 + ALAC), high (CRF 18 + ALAC), balanced (CRF 20 + AAC)."
 )
 _TIP_ENHANCE_A = (
@@ -228,24 +289,25 @@ _TIP_ENHANCE_V = (
     "Enable video enhance options (A/V sync tighten, light denoise). Off for archive masters."
 )
 _TIP_EQ = (
-    "Enhance EQ: none, auto-clarity (mild mid scoop / presence), or target-curve "
-    "(multi-band inspired profiles)."
+    "Enhance EQ: off, auto clarity (mild mid scoop / presence), or a named target curve."
 )
 _TIP_EQ_CURVE = (
-    "Target curve when EQ mode is target-curve: flat, harman, diffuse-field, "
+    "Target curve when EQ mode is Target curve: flat, Harman-inspired, diffuse-field, "
     "equal-loudness, warm, analytical, vocal-presence, small-speaker. "
     "Inspired approximations — not calibrated lab targets."
 )
 _TIP_IMAGE = (
-    "Stereo image / holography-style strength 0–100 (M/S + ambience; mild XTC on speakers). "
-    "Not trademark Sonic Holography."
+    "Stereo width 0–100 (M/S + ambience; mild crosstalk cancel on speakers). "
+    "0 = off. Not trademark Sonic Holography."
 )
-_TIP_IMAGE_MODE = "Speaker (mild crosstalk cancel) or headphone (width + presence shelf)."
+_TIP_IMAGE_MODE = (
+    "Speakers (mild crosstalk cancel) or headphones (width + presence shelf)."
+)
 _TIP_IMMERSION = (
-    "WFS-inspired immersion: off, binaural (headphones), or speaker-wide. "
+    "Immersion: off, binaural (headphones), or wider speakers. "
     "Stereo only — not true wave-field synthesis."
 )
-_TIP_IMMERSION_DEPTH = "How deep the immersion stage / early reflections feel (0–1)."
+_TIP_IMMERSION_DEPTH = "How deep the immersion stage / early reflections feel (subtle → deep)."
 _TIP_CROSSFEED = "Bauer-style lowpassed headphone crossfeed (pairs well with binaural immersion)."
 _TIP_SYNC = "Tighten A/V sync with ffmpeg aresample=async (requires Enhance video)."
 _TIP_DENOISE = (
@@ -258,7 +320,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("UpConvert All The Things")
-        self.resize(880, 720)
+        self.resize(900, 760)
         self.setMinimumSize(480, 520)
         self._worker: Worker | None = None
         self._thread: QThread | None = None
@@ -268,7 +330,7 @@ class MainWindow(QMainWindow):
         self._source_wav: Path | None = None
         self._processed_wav: Path | None = None
         self._playing_processed = True
-        self._layout_key: tuple[int, int, bool] | None = None
+        self._layout_key: tuple | None = None
         self._applying_preset = False
 
         root = QWidget()
@@ -277,21 +339,60 @@ class MainWindow(QMainWindow):
         self._root_layout.setSpacing(8)
         self._root_layout.setContentsMargins(8, 8, 8, 8)
 
-        self._honesty = _wrap_label(HONESTY)
-        self._honesty.setToolTip(HONESTY)
-        self._honesty.setTextInteractionFlags(
+        self._build_honesty()
+        self._build_files()
+        self._build_preset_header()
+        self._build_summary()
+        self._build_options()
+        self._build_output_folder()
+        self._build_preview()
+        self._build_run()
+        self._build_log()
+
+        self._output = Path("output")
+        self._player = QMediaPlayer(self)
+        self._audio_out = QAudioOutput(self)
+        self._player.setAudioOutput(self._audio_out)
+        self._audio_out.setVolume(1.0)
+
+        self._apply_preset(DEFAULT_PRESET)
+        self._sync_ml_checkbox_availability()
+        self._sync_control_enablement()
+        self._update_summary()
+        self._reflow_layout(force=True)
+
+    def _build_honesty(self) -> None:
+        short = _wrap_label(HONESTY_SHORT)
+        short.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._limits_btn = QToolButton()
+        self._limits_btn.setText("About limits")
+        self._limits_btn.setCheckable(True)
+        self._limits_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._limits_btn.setArrowType(Qt.ArrowType.RightArrow)
+        self._limits_btn.setToolTip("Show what this app does and does not claim to do.")
+        self._limits_btn.toggled.connect(self._toggle_limits)
+        head = QHBoxLayout()
+        head.addWidget(short, stretch=1)
+        head.addWidget(self._limits_btn)
+        self._root_layout.addLayout(head)
+
+        self._honesty_full = _wrap_label(HONESTY)
+        self._honesty_full.setToolTip(HONESTY)
+        self._honesty_full.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        self._root_layout.addWidget(self._honesty)
+        self._honesty_full.setVisible(False)
+        self._root_layout.addWidget(self._honesty_full)
 
+    def _build_files(self) -> None:
+        files_box, files_lay = _make_group("Files to process")
         self.list = QListWidget()
         self.list.setMinimumHeight(48)
         self.list.setToolTip("Queue of files to process. Select one for A/B Preview.")
         self.list.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self._root_layout.addWidget(self.list, stretch=2)
-
+        files_lay.addWidget(self.list, stretch=1)
         file_btns = QGridLayout()
         file_btns.setSpacing(6)
         add_btn = QPushButton("Add files…")
@@ -303,163 +404,328 @@ class MainWindow(QMainWindow):
         clear_btn = QPushButton("Clear")
         clear_btn.setToolTip("Remove all files from the queue.")
         clear_btn.clicked.connect(self.list.clear)
-        for i, btn in enumerate((add_btn, add_dir, clear_btn)):
+        self._file_btns = (add_btn, add_dir, clear_btn)
+        self._file_btns_grid = file_btns
+        for i, btn in enumerate(self._file_btns):
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             file_btns.addWidget(btn, 0, i)
-        self._root_layout.addLayout(file_btns)
+        files_lay.addLayout(file_btns)
+        self._files_box = files_box
+        self._root_layout.addWidget(files_box, stretch=2)
+        model = self.list.model()
+        model.rowsInserted.connect(self._update_summary)
+        model.rowsRemoved.connect(self._update_summary)
 
-        # --- Options (scrollable, grouped) ---
+    def _build_preset_header(self) -> None:
+        self.preset = QComboBox()
+        for p in list_presets():
+            self.preset.addItem(p.label, p.id)
+            self.preset.setItemData(
+                self.preset.count() - 1,
+                p.description,
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        self.preset.addItem("Custom", CUSTOM_ID)
+        self.preset.setItemData(
+            self.preset.count() - 1,
+            "Manual settings (no longer a named preset).",
+            Qt.ItemDataRole.ToolTipRole,
+        )
+        self.preset.currentIndexChanged.connect(self._on_preset_chosen)
+        self._root_layout.addWidget(_labeled_row("Preset", self.preset, _TIP_PRESET))
+
+        self._preset_desc = _wrap_label("")
+        self._preset_desc.setObjectName("presetDescription")
+        self._root_layout.addWidget(self._preset_desc)
+
+        self._custom_note = _wrap_label(
+            "You changed settings from the preset defaults."
+        )
+        self._custom_note.setVisible(False)
+        self._root_layout.addWidget(self._custom_note)
+
+        self.chk_advanced = QCheckBox("Show advanced settings")
+        self.chk_advanced.setToolTip(_TIP_ADVANCED)
+        stored = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(
+            "showAdvanced", False, type=bool
+        )
+        self.chk_advanced.setChecked(bool(stored))
+        self.chk_advanced.toggled.connect(self._on_advanced_toggled)
+        self._root_layout.addWidget(self.chk_advanced)
+
+    def _build_summary(self) -> None:
+        box, lay = _make_group("What will happen")
+        self._summary = _wrap_label("")
+        self._summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._summary.setToolTip(
+            "Live recap of the current pipeline. Updates as you change settings."
+        )
+        lay.addWidget(self._summary)
+        self._root_layout.addWidget(box)
+
+    def _build_options(self) -> None:
         opts_inner = QWidget()
         opts_layout = QVBoxLayout(opts_inner)
         opts_layout.setContentsMargins(0, 0, 4, 0)
         opts_layout.setSpacing(8)
 
-        self.preset = QComboBox()
-        for p in list_presets():
-            self.preset.addItem(p.label, p.id)
-        self.preset.addItem("Custom", CUSTOM_ID)
-        self.preset.currentIndexChanged.connect(self._on_preset_chosen)
-        opts_layout.addWidget(_labeled_row("Preset", self.preset, _TIP_PRESET))
-
-        # Process
+        # --- 1. Repair ---
         self.chk_repair_a = QCheckBox("Repair audio")
         self.chk_repair_a.setToolTip(_TIP_REPAIR_A)
         self.chk_repair_v = QCheckBox("Repair video")
         self.chk_repair_v.setToolTip(_TIP_REPAIR_V)
-        self.chk_up_a = QCheckBox("Upconvert audio")
-        self.chk_up_a.setToolTip(_TIP_UP_A)
-        self.chk_up_v = QCheckBox("Upconvert video (FFV1)")
-        self.chk_up_v.setToolTip(_TIP_UP_V)
-        self.chk_ml = QCheckBox("ML upscaler")
-        self.chk_ml.setToolTip(_TIP_ML)
-        self._sync_ml_checkbox_availability()
-        self.chk_native_sr = QCheckBox("Native sample rate")
-        self.chk_native_sr.setToolTip(_TIP_NATIVE_SR)
-
         self.strength = QComboBox()
-        self.strength.addItems(["light", "medium", "strong"])
+        _fill_combo(
+            self.strength,
+            [
+                ("Light — less cleanup", "light"),
+                ("Medium", "medium"),
+                ("Strong — more artifact cleanup", "strong"),
+            ],
+        )
+
+        repair_box, repair_lay = _make_group("1. Repair")
+        self._repair_checks = (self.chk_repair_a, self.chk_repair_v)
+        self._repair_checks_grid = QGridLayout()
+        self._repair_checks_grid.setSpacing(4)
+        repair_lay.addLayout(self._repair_checks_grid)
+        self._repair_nested, repair_nested_lay = _make_nested()
+        self._repair_setting_rows = (
+            _labeled_row("Strength", self.strength, _TIP_STRENGTH),
+        )
+        self._repair_settings_grid = QGridLayout()
+        self._repair_settings_grid.setSpacing(4)
+        repair_nested_lay.addLayout(self._repair_settings_grid)
+        repair_lay.addWidget(self._repair_nested)
+        opts_layout.addWidget(repair_box)
+
+        # --- 2. Upconvert ---
+        self.chk_up_a = QCheckBox("Upconvert audio (20/24-bit)")
+        self.chk_up_a.setToolTip(_TIP_UP_A)
+        self.chk_up_v = QCheckBox("Re-encode video losslessly")
+        self.chk_up_v.setToolTip(_TIP_UP_V)
+        self.chk_ml = QCheckBox("Richer detail (optional ML)")
+        self.chk_ml.setToolTip(_TIP_ML)
         self.bits = QComboBox()
-        self.bits.addItems(["24", "20"])
+        _fill_combo(
+            self.bits,
+            [("24-bit (default)", 24), ("20-bit", 20)],
+        )
         self.expand_iters = QSpinBox()
         self.expand_iters.setRange(1, 12)
         self.expand_iters.setValue(5)
         self.dither = QComboBox()
-        self.dither.addItems(["sbm", "tpdf", "none"])
-        self.dither.setCurrentText("sbm")
+        _fill_combo(
+            self.dither,
+            [
+                ("SBM noise-shaped (recommended)", "sbm"),
+                ("Flat TPDF", "tpdf"),
+                ("None", "none"),
+            ],
+        )
 
-        proc_box, proc_lay = _make_group("Process")
-        self._proc_checks = (
+        up_box, up_lay = _make_group("2. Upconvert")
+        self._up_checks = (self.chk_up_a, self.chk_up_v)
+        self._up_checks_grid = QGridLayout()
+        self._up_checks_grid.setSpacing(4)
+        up_lay.addLayout(self._up_checks_grid)
+        self._up_nested, up_nested_lay = _make_nested()
+        self._up_nested_checks = (self.chk_ml,)
+        self._up_nested_checks_grid = QGridLayout()
+        self._up_nested_checks_grid.setSpacing(4)
+        up_nested_lay.addLayout(self._up_nested_checks_grid)
+        self._up_setting_rows = (
+            _labeled_row("Bit depth", self.bits, _TIP_BITS),
+            _labeled_row("Expand iterations", self.expand_iters, _TIP_ITERS),
+            _labeled_row("Dither", self.dither, _TIP_DITHER),
+        )
+        self._up_settings_grid = QGridLayout()
+        self._up_settings_grid.setSpacing(4)
+        up_nested_lay.addLayout(self._up_settings_grid)
+        up_lay.addWidget(self._up_nested)
+        opts_layout.addWidget(up_box)
+
+        # --- 3. Enhance audio ---
+        self.chk_enhance_a = QCheckBox("Enhance audio (listening)")
+        self.chk_enhance_a.setToolTip(_TIP_ENHANCE_A)
+        self.chk_crossfeed = QCheckBox("Headphone crossfeed")
+        self.chk_crossfeed.setToolTip(_TIP_CROSSFEED)
+        self.eq_mode = QComboBox()
+        _fill_combo(
+            self.eq_mode,
+            [
+                ("Off", "none"),
+                ("Auto clarity (mild presence)", "auto-clarity"),
+                ("Target curve", "target-curve"),
+            ],
+        )
+        self.eq_curve = QComboBox()
+        _fill_combo(
+            self.eq_curve,
+            [
+                (_EQ_CURVE_LABELS.get(cid, cid), cid)
+                for cid in list_eq_curves()
+            ],
+        )
+        self.stereo_image = QSpinBox()
+        self.stereo_image.setRange(0, 100)
+        self.stereo_image.setSuffix(" %")
+        self.stereo_image_mode = QComboBox()
+        _fill_combo(
+            self.stereo_image_mode,
+            [
+                ("Speakers (mild crosstalk cancel)", "speaker"),
+                ("Headphones (width + presence)", "headphone"),
+            ],
+        )
+        self.immersion = QComboBox()
+        _fill_combo(
+            self.immersion,
+            [
+                ("Off", "off"),
+                ("Binaural (headphones)", "binaural"),
+                ("Wider speakers (not true WFS)", "speaker-wide"),
+            ],
+        )
+        self.immersion_depth = QSpinBox()
+        self.immersion_depth.setRange(0, 100)
+        self.immersion_depth.setSuffix(" %")
+        self.immersion_depth.setValue(35)
+
+        enh_a_box, enh_a_lay = _make_group("3. Enhance audio (listening)")
+        enh_a_lay.addWidget(self.chk_enhance_a)
+        self._enh_a_nested, enh_a_nested_lay = _make_nested()
+        self._enh_a_nested_checks = (self.chk_crossfeed,)
+        self._enh_a_nested_checks_grid = QGridLayout()
+        self._enh_a_nested_checks_grid.setSpacing(4)
+        enh_a_nested_lay.addLayout(self._enh_a_nested_checks_grid)
+        self._eq_curve_row = _labeled_row("EQ curve", self.eq_curve, _TIP_EQ_CURVE)
+        self._image_mode_row = _labeled_row(
+            "Playback", self.stereo_image_mode, _TIP_IMAGE_MODE
+        )
+        self._immersion_depth_row = _labeled_row(
+            "Stage depth", self.immersion_depth, _TIP_IMMERSION_DEPTH
+        )
+        self._enh_a_setting_rows = (
+            _labeled_row("EQ", self.eq_mode, _TIP_EQ),
+            self._eq_curve_row,
+            _labeled_row("Stereo width", self.stereo_image, _TIP_IMAGE),
+            self._image_mode_row,
+            _labeled_row("Immersion", self.immersion, _TIP_IMMERSION),
+            self._immersion_depth_row,
+        )
+        self._enh_a_settings_grid = QGridLayout()
+        self._enh_a_settings_grid.setSpacing(4)
+        enh_a_nested_lay.addLayout(self._enh_a_settings_grid)
+        enh_a_lay.addWidget(self._enh_a_nested)
+        opts_layout.addWidget(enh_a_box)
+
+        # --- 4. Enhance video ---
+        self.chk_enhance_v = QCheckBox("Enhance video")
+        self.chk_enhance_v.setToolTip(_TIP_ENHANCE_V)
+        self.chk_sync = QCheckBox("Tighten A/V sync")
+        self.chk_sync.setToolTip(_TIP_SYNC)
+        self.chk_denoise = QCheckBox("Light video denoise")
+        self.chk_denoise.setToolTip(_TIP_DENOISE)
+
+        enh_v_box, enh_v_lay = _make_group("4. Enhance video")
+        enh_v_lay.addWidget(self.chk_enhance_v)
+        self._enh_v_nested, enh_v_nested_lay = _make_nested()
+        self._enh_v_checks = (self.chk_sync, self.chk_denoise)
+        self._enh_v_checks_grid = QGridLayout()
+        self._enh_v_checks_grid.setSpacing(4)
+        enh_v_nested_lay.addLayout(self._enh_v_checks_grid)
+        enh_v_lay.addWidget(self._enh_v_nested)
+        opts_layout.addWidget(enh_v_box)
+
+        # --- 5. Output ---
+        self.chk_compress = QCheckBox("Also write a smaller delivery MP4")
+        self.chk_compress.setToolTip(_TIP_COMPRESS)
+        self.chk_native_sr = QCheckBox("Keep source sample rate")
+        self.chk_native_sr.setToolTip(_TIP_NATIVE_SR)
+        self.container = QComboBox()
+        _fill_combo(
+            self.container,
+            [
+                ("MKV (best for lossless)", "mkv"),
+                ("MP4 (broader playback)", "mp4"),
+            ],
+        )
+        self.flac_level = QSpinBox()
+        self.flac_level.setRange(0, 8)
+        self.flac_level.setValue(5)
+        self.compress_quality = QComboBox()
+        _fill_combo(
+            self.compress_quality,
+            [
+                ("Transparent (largest)", "transparent"),
+                ("High", "high"),
+                ("Balanced (smaller)", "balanced"),
+            ],
+        )
+
+        out_box, out_lay = _make_group("5. Output")
+        self._container_row = _labeled_row("Container", self.container, _TIP_CONTAINER)
+        out_lay.addWidget(self._container_row)
+        out_lay.addWidget(self.chk_compress)
+        self._out_nested, out_nested_lay = _make_nested()
+        self._out_nested_checks = (self.chk_native_sr,)
+        self._out_nested_checks_grid = QGridLayout()
+        self._out_nested_checks_grid.setSpacing(4)
+        out_nested_lay.addLayout(self._out_nested_checks_grid)
+        self._mp4q_row = _labeled_row(
+            "Delivery quality", self.compress_quality, _TIP_MP4Q
+        )
+        self._out_setting_rows = (
+            _labeled_row("FLAC compression", self.flac_level, _TIP_FLAC),
+            self._mp4q_row,
+        )
+        self._out_settings_grid = QGridLayout()
+        self._out_settings_grid.setSpacing(4)
+        out_nested_lay.addLayout(self._out_settings_grid)
+        out_lay.addWidget(self._out_nested)
+        opts_layout.addWidget(out_box)
+
+        self._checkboxes = (
             self.chk_repair_a,
             self.chk_repair_v,
             self.chk_up_a,
             self.chk_up_v,
             self.chk_ml,
             self.chk_native_sr,
+            self.chk_compress,
+            self.chk_enhance_a,
+            self.chk_crossfeed,
+            self.chk_enhance_v,
+            self.chk_sync,
+            self.chk_denoise,
         )
-        self._proc_checks_grid = QGridLayout()
-        self._proc_checks_grid.setSpacing(4)
-        proc_lay.addLayout(self._proc_checks_grid)
-        self._proc_setting_rows = (
-            _labeled_row("Strength", self.strength, _TIP_STRENGTH),
-            _labeled_row("Bits", self.bits, _TIP_BITS),
-            _labeled_row("Iterations", self.expand_iters, _TIP_ITERS),
-            _labeled_row("Dither", self.dither, _TIP_DITHER),
+        self._combos = (
+            self.strength,
+            self.bits,
+            self.dither,
+            self.container,
+            self.compress_quality,
+            self.eq_mode,
+            self.eq_curve,
+            self.stereo_image_mode,
+            self.immersion,
         )
-        self._proc_settings_grid = QGridLayout()
-        self._proc_settings_grid.setSpacing(4)
-        proc_lay.addLayout(self._proc_settings_grid)
-        opts_layout.addWidget(proc_box)
-
-        # Output
-        self.chk_compress = QCheckBox("Post-compress MP4")
-        self.chk_compress.setToolTip(_TIP_COMPRESS)
-        self.container = QComboBox()
-        self.container.addItems(["mkv", "mp4"])
-        self.flac_level = QSpinBox()
-        self.flac_level.setRange(0, 8)
-        self.flac_level.setValue(5)
-        self.compress_quality = QComboBox()
-        self.compress_quality.addItems(["transparent", "high", "balanced"])
-
-        out_box, out_lay = _make_group("Output")
-        self._out_checks = (self.chk_compress,)
-        self._out_checks_grid = QGridLayout()
-        self._out_checks_grid.setSpacing(4)
-        out_lay.addLayout(self._out_checks_grid)
-        self._out_setting_rows = (
-            _labeled_row("Container", self.container, _TIP_CONTAINER),
-            _labeled_row("FLAC level", self.flac_level, _TIP_FLAC),
-            _labeled_row("MP4 quality", self.compress_quality, _TIP_MP4Q),
-        )
-        self._out_settings_grid = QGridLayout()
-        self._out_settings_grid.setSpacing(4)
-        out_lay.addLayout(self._out_settings_grid)
-        opts_layout.addWidget(out_box)
-
-        # Enhance audio
-        self.chk_enhance_a = QCheckBox("Enable enhance audio")
-        self.chk_enhance_a.setToolTip(_TIP_ENHANCE_A)
-        self.chk_crossfeed = QCheckBox("Crossfeed")
-        self.chk_crossfeed.setToolTip(_TIP_CROSSFEED)
-        self.eq_mode = QComboBox()
-        self.eq_mode.addItems(["none", "auto-clarity", "target-curve"])
-        self.eq_curve = QComboBox()
-        self.eq_curve.addItems(list(list_eq_curves()))
-        self.stereo_image = QSpinBox()
-        self.stereo_image.setRange(0, 100)
-        self.stereo_image_mode = QComboBox()
-        self.stereo_image_mode.addItems(["speaker", "headphone"])
-        self.immersion = QComboBox()
-        self.immersion.addItems(["off", "binaural", "speaker-wide"])
-        self.immersion_depth = QDoubleSpinBox()
-        self.immersion_depth.setRange(0.0, 1.0)
-        self.immersion_depth.setSingleStep(0.05)
-        self.immersion_depth.setValue(0.35)
-
-        enh_a_box, enh_a_lay = _make_group("Enhance audio (listening)")
-        self._enh_a_checks = (self.chk_enhance_a, self.chk_crossfeed)
-        self._enh_a_checks_grid = QGridLayout()
-        self._enh_a_checks_grid.setSpacing(4)
-        enh_a_lay.addLayout(self._enh_a_checks_grid)
-        self._enh_a_setting_rows = (
-            _labeled_row("EQ mode", self.eq_mode, _TIP_EQ),
-            _labeled_row("EQ curve", self.eq_curve, _TIP_EQ_CURVE),
-            _labeled_row("Stereo image", self.stereo_image, _TIP_IMAGE),
-            _labeled_row("Image mode", self.stereo_image_mode, _TIP_IMAGE_MODE),
-            _labeled_row("Immersion", self.immersion, _TIP_IMMERSION),
-            _labeled_row("Immersion depth", self.immersion_depth, _TIP_IMMERSION_DEPTH),
-        )
-        self._enh_a_settings_grid = QGridLayout()
-        self._enh_a_settings_grid.setSpacing(4)
-        enh_a_lay.addLayout(self._enh_a_settings_grid)
-        opts_layout.addWidget(enh_a_box)
-
-        # Enhance video
-        self.chk_enhance_v = QCheckBox("Enable enhance video")
-        self.chk_enhance_v.setToolTip(_TIP_ENHANCE_V)
-        self.chk_sync = QCheckBox("A/V sync tighten")
-        self.chk_sync.setToolTip(_TIP_SYNC)
-        self.chk_denoise = QCheckBox("Video denoise")
-        self.chk_denoise.setToolTip(_TIP_DENOISE)
-
-        enh_v_box, enh_v_lay = _make_group("Enhance video")
-        self._enh_v_checks = (self.chk_enhance_v, self.chk_sync, self.chk_denoise)
-        self._enh_v_checks_grid = QGridLayout()
-        self._enh_v_checks_grid.setSpacing(4)
-        enh_v_lay.addLayout(self._enh_v_checks_grid)
-        opts_layout.addWidget(enh_v_box)
-
-        self._checkboxes = (
-            *self._proc_checks,
-            *self._out_checks,
-            *self._enh_a_checks,
-            *self._enh_v_checks,
+        self._spins = (
+            self.expand_iters,
+            self.flac_level,
+            self.stereo_image,
+            self.immersion_depth,
         )
         self._option_grids = (
-            (self._proc_checks_grid, self._proc_checks, self._proc_settings_grid, self._proc_setting_rows),
-            (self._out_checks_grid, self._out_checks, self._out_settings_grid, self._out_setting_rows),
-            (self._enh_a_checks_grid, self._enh_a_checks, self._enh_a_settings_grid, self._enh_a_setting_rows),
+            (self._repair_checks_grid, self._repair_checks, self._repair_settings_grid, self._repair_setting_rows),
+            (self._up_checks_grid, self._up_checks, self._up_settings_grid, self._up_setting_rows),
+            (self._up_nested_checks_grid, self._up_nested_checks, None, ()),
+            (self._enh_a_nested_checks_grid, self._enh_a_nested_checks, self._enh_a_settings_grid, self._enh_a_setting_rows),
             (self._enh_v_checks_grid, self._enh_v_checks, None, ()),
+            (self._out_nested_checks_grid, self._out_nested_checks, self._out_settings_grid, self._out_setting_rows),
         )
 
         opts_scroll = QScrollArea()
@@ -474,27 +740,15 @@ class MainWindow(QMainWindow):
         self._root_layout.addWidget(opts_scroll, stretch=3)
 
         for chk in self._checkboxes:
-            chk.toggled.connect(self._mark_custom_preset)
-            chk.toggled.connect(self._sync_control_enablement)
-        self.strength.currentIndexChanged.connect(self._mark_custom_preset)
-        self.bits.currentIndexChanged.connect(self._mark_custom_preset)
-        self.expand_iters.valueChanged.connect(self._mark_custom_preset)
-        self.dither.currentIndexChanged.connect(self._mark_custom_preset)
-        self.container.currentIndexChanged.connect(self._mark_custom_preset)
-        self.flac_level.valueChanged.connect(self._mark_custom_preset)
-        self.compress_quality.currentIndexChanged.connect(self._mark_custom_preset)
-        self.eq_mode.currentIndexChanged.connect(self._mark_custom_preset)
-        self.eq_mode.currentIndexChanged.connect(self._sync_control_enablement)
-        self.eq_curve.currentIndexChanged.connect(self._mark_custom_preset)
-        self.stereo_image.valueChanged.connect(self._mark_custom_preset)
-        self.stereo_image.valueChanged.connect(self._sync_control_enablement)
-        self.stereo_image_mode.currentIndexChanged.connect(self._mark_custom_preset)
-        self.immersion.currentIndexChanged.connect(self._mark_custom_preset)
-        self.immersion.currentIndexChanged.connect(self._sync_control_enablement)
-        self.immersion_depth.valueChanged.connect(self._mark_custom_preset)
+            chk.toggled.connect(self._on_user_option_changed)
+        for combo in self._combos:
+            combo.currentIndexChanged.connect(self._on_user_option_changed)
+        for spin in self._spins:
+            spin.valueChanged.connect(self._on_user_option_changed)
 
+    def _build_output_folder(self) -> None:
         out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("Output:"))
+        out_row.addWidget(QLabel("Save to:"))
         self.out_label = _wrap_label(str(Path("output").resolve()))
         self.out_label.setToolTip("Current output folder path.")
         self.out_label.setTextInteractionFlags(
@@ -508,8 +762,10 @@ class MainWindow(QMainWindow):
         out_row.addWidget(out_btn)
         self._root_layout.addLayout(out_row)
 
-        self._run_grid = QGridLayout()
-        self._run_grid.setSpacing(6)
+    def _build_preview(self) -> None:
+        box, lay = _make_group("Preview")
+        self._preview_grid = QGridLayout()
+        self._preview_grid.setSpacing(6)
         self.preview_btn = QPushButton("A/B Preview")
         self.preview_btn.setToolTip(
             "Build ~15s from the selected file with current audio settings, "
@@ -528,22 +784,33 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.setToolTip("Stop A/B preview playback.")
         self.stop_btn.clicked.connect(self.stop_preview)
-        self.run_btn = QPushButton("Run")
-        self.run_btn.setToolTip("Process every file in the queue with the current settings.")
-        self.run_btn.clicked.connect(self.start)
-        self._action_btns = (
+        self._preview_btns = (
             self.preview_btn,
             self.toggle_btn,
             self.play_btn,
             self.stop_btn,
-            self.run_btn,
         )
-        self._root_layout.addLayout(self._run_grid)
-
-        self.preview_status = _wrap_label("A/B: select a file, then A/B Preview.")
+        lay.addLayout(self._preview_grid)
+        self.preview_status = _wrap_label("Select a file, then A/B Preview.")
         self.preview_status.setMaximumHeight(48)
-        self._root_layout.addWidget(self.preview_status)
+        lay.addWidget(self.preview_status)
+        self._root_layout.addWidget(box)
 
+    def _build_run(self) -> None:
+        self.run_btn = QPushButton("Run")
+        self.run_btn.setDefault(True)
+        self.run_btn.setMinimumHeight(36)
+        font = self.run_btn.font()
+        font.setBold(True)
+        self.run_btn.setFont(font)
+        self.run_btn.setToolTip(
+            "Process every file in the queue with the current settings."
+        )
+        self.run_btn.clicked.connect(self.start)
+        self._root_layout.addWidget(self.run_btn)
+
+    def _build_log(self) -> None:
+        box, lay = _make_group("Progress")
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(48)
@@ -551,27 +818,32 @@ class MainWindow(QMainWindow):
         self.log.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self._root_layout.addWidget(self.log, stretch=2)
+        lay.addWidget(self.log)
+        self._log_box = box
+        self._root_layout.addWidget(box, stretch=2)
 
-        self._output = Path("output")
-        self._player = QMediaPlayer(self)
-        self._audio_out = QAudioOutput(self)
-        self._player.setAudioOutput(self._audio_out)
-        self._audio_out.setVolume(1.0)
+    @Slot(bool)
+    def _toggle_limits(self, on: bool) -> None:
+        self._honesty_full.setVisible(on)
+        self._limits_btn.setArrowType(
+            Qt.ArrowType.DownArrow if on else Qt.ArrowType.RightArrow
+        )
 
-        self._apply_preset(DEFAULT_PRESET)
-        self._sync_ml_checkbox_availability()
+    @Slot(bool)
+    def _on_advanced_toggled(self, on: bool) -> None:
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue("showAdvanced", on)
         self._sync_control_enablement()
-        self._reflow_layout(force=True)
 
     def _sync_ml_checkbox_availability(self) -> None:
         available = ml_available()
-        self.chk_ml.setEnabled(available)
+        self.chk_ml.setEnabled(available and self.chk_up_a.isChecked())
         if available:
             self.chk_ml.setToolTip(_TIP_ML)
-        else:
-            self.chk_ml.setChecked(False)
-            self.chk_ml.setToolTip(_TIP_ML_UNAVAILABLE)
+            return
+        blocked = self.chk_ml.blockSignals(True)
+        self.chk_ml.setChecked(False)
+        self.chk_ml.blockSignals(blocked)
+        self.chk_ml.setToolTip(_TIP_ML_UNAVAILABLE)
 
     def _set_preset_combo(self, preset_id: str) -> None:
         idx = self.preset.findData(preset_id)
@@ -588,20 +860,29 @@ class MainWindow(QMainWindow):
             "repair_video": (self.chk_repair_v.setChecked, self.chk_repair_v.isChecked),
             "upconvert_audio": (self.chk_up_a.setChecked, self.chk_up_a.isChecked),
             "upconvert_video": (self.chk_up_v.setChecked, self.chk_up_v.isChecked),
-            "repair_strength": (self.strength.setCurrentText, self.strength.currentText),
+            "repair_strength": (
+                lambda v: _set_combo_data(self.strength, v),
+                lambda: self.strength.currentData(),
+            ),
             "output_bits": (
-                lambda v: self.bits.setCurrentText(str(v)),
-                lambda: int(self.bits.currentText()),
+                lambda v: _set_combo_data(self.bits, int(v)),
+                lambda: int(self.bits.currentData()),
             ),
             "ml_upscaler": (self.chk_ml.setChecked, self.chk_ml.isChecked),
             "expand_iterations": (self.expand_iters.setValue, self.expand_iters.value),
-            "dither": (self.dither.setCurrentText, self.dither.currentText),
+            "dither": (
+                lambda v: _set_combo_data(self.dither, v),
+                lambda: self.dither.currentData(),
+            ),
             "flac_level": (self.flac_level.setValue, self.flac_level.value),
-            "container": (self.container.setCurrentText, self.container.currentText),
+            "container": (
+                lambda v: _set_combo_data(self.container, v),
+                lambda: self.container.currentData(),
+            ),
             "compress_mp4": (self.chk_compress.setChecked, self.chk_compress.isChecked),
             "compress_quality": (
-                self.compress_quality.setCurrentText,
-                self.compress_quality.currentText,
+                lambda v: _set_combo_data(self.compress_quality, v),
+                lambda: self.compress_quality.currentData(),
             ),
             "native_sample_rate": (
                 self.chk_native_sr.setChecked,
@@ -609,17 +890,26 @@ class MainWindow(QMainWindow):
             ),
             "enhance_audio": (self.chk_enhance_a.setChecked, self.chk_enhance_a.isChecked),
             "enhance_video": (self.chk_enhance_v.setChecked, self.chk_enhance_v.isChecked),
-            "eq_mode": (self.eq_mode.setCurrentText, self.eq_mode.currentText),
-            "eq_curve": (self.eq_curve.setCurrentText, self.eq_curve.currentText),
+            "eq_mode": (
+                lambda v: _set_combo_data(self.eq_mode, v),
+                lambda: self.eq_mode.currentData(),
+            ),
+            "eq_curve": (
+                lambda v: _set_combo_data(self.eq_curve, v),
+                lambda: self.eq_curve.currentData(),
+            ),
             "stereo_image_strength": (self.stereo_image.setValue, self.stereo_image.value),
             "stereo_image_mode": (
-                self.stereo_image_mode.setCurrentText,
-                self.stereo_image_mode.currentText,
+                lambda v: _set_combo_data(self.stereo_image_mode, v),
+                lambda: self.stereo_image_mode.currentData(),
             ),
-            "immersion": (self.immersion.setCurrentText, self.immersion.currentText),
+            "immersion": (
+                lambda v: _set_combo_data(self.immersion, v),
+                lambda: self.immersion.currentData(),
+            ),
             "immersion_depth": (
-                self.immersion_depth.setValue,
-                lambda: float(self.immersion_depth.value()),
+                lambda v: self.immersion_depth.setValue(int(round(float(v) * 100))),
+                lambda: float(self.immersion_depth.value()) / 100.0,
             ),
             "crossfeed": (self.chk_crossfeed.setChecked, self.chk_crossfeed.isChecked),
             "video_sync_tighten": (self.chk_sync.setChecked, self.chk_sync.isChecked),
@@ -629,6 +919,7 @@ class MainWindow(QMainWindow):
     def _apply_preset(self, preset_id: str) -> None:
         if preset_id == CUSTOM_ID:
             self._set_preset_combo(CUSTOM_ID)
+            self._update_summary()
             return
         p = get_preset(preset_id)
         self._applying_preset = True
@@ -638,37 +929,75 @@ class MainWindow(QMainWindow):
                 setter, _getter = bindings[field]
                 setter(getattr(p, field))
             self._set_preset_combo(preset_id)
+            self._sync_ml_checkbox_availability()
+            self._sync_control_enablement()
         finally:
             self._applying_preset = False
-        self._sync_ml_checkbox_availability()
-        self._sync_control_enablement()
+        self._update_summary()
 
     def _sync_control_enablement(self) -> None:
-        """Grey out dependent controls when their parent stage is off."""
+        """Hide nested knobs unless Advanced is on and the parent stage is on."""
         repair_on = self.chk_repair_a.isChecked()
         up_on = self.chk_up_a.isChecked()
         compress_on = self.chk_compress.isChecked()
         enh_a = self.chk_enhance_a.isChecked()
         enh_v = self.chk_enhance_v.isChecked()
+        advanced = self.chk_advanced.isChecked()
         ml_ok = ml_available()
 
+        self.chk_ml.setEnabled(up_on and ml_ok)
+        self.chk_crossfeed.setEnabled(enh_a)
+        self.eq_mode.setEnabled(enh_a)
+        self.eq_curve.setEnabled(enh_a and self.eq_mode.currentData() == "target-curve")
+        self.stereo_image.setEnabled(enh_a)
+        self.stereo_image_mode.setEnabled(enh_a and self.stereo_image.value() > 0)
+        self.immersion.setEnabled(enh_a)
+        self.immersion_depth.setEnabled(
+            enh_a and self.immersion.currentData() != "off"
+        )
+        self.chk_sync.setEnabled(enh_v)
+        self.chk_denoise.setEnabled(enh_v)
+        self.compress_quality.setEnabled(compress_on)
         self.strength.setEnabled(repair_on)
         self.bits.setEnabled(up_on)
         self.expand_iters.setEnabled(up_on)
         self.dither.setEnabled(up_on)
-        self.chk_ml.setEnabled(up_on and ml_ok)
-        self.compress_quality.setEnabled(compress_on)
 
-        self.chk_crossfeed.setEnabled(enh_a)
-        self.eq_mode.setEnabled(enh_a)
-        self.eq_curve.setEnabled(enh_a and self.eq_mode.currentText() == "target-curve")
-        self.stereo_image.setEnabled(enh_a)
-        self.stereo_image_mode.setEnabled(enh_a and self.stereo_image.value() > 0)
-        self.immersion.setEnabled(enh_a)
-        self.immersion_depth.setEnabled(enh_a and self.immersion.currentText() != "off")
+        self._repair_nested.setVisible(advanced and repair_on)
+        self._up_nested.setVisible(advanced and up_on)
+        self._enh_a_nested.setVisible(advanced and enh_a)
+        self._enh_v_nested.setVisible(advanced and enh_v)
+        self._out_nested.setVisible(advanced)
+        self._eq_curve_row.setVisible(self.eq_mode.currentData() == "target-curve")
+        self._image_mode_row.setVisible(self.stereo_image.value() > 0)
+        self._immersion_depth_row.setVisible(self.immersion.currentData() != "off")
+        self._mp4q_row.setVisible(compress_on)
 
-        self.chk_sync.setEnabled(enh_v)
-        self.chk_denoise.setEnabled(enh_v)
+    def _queue_paths(self) -> list[Path]:
+        return [Path(self.list.item(i).text()) for i in range(self.list.count())]
+
+    def _update_summary(self) -> None:
+        if not hasattr(self, "_summary"):
+            return
+        custom = self.preset.currentData() == CUSTOM_ID
+        self._custom_note.setVisible(bool(custom))
+        pid = self.preset.currentData()
+        if pid and pid != CUSTOM_ID:
+            self._preset_desc.setText(get_preset(str(pid)).description)
+        else:
+            self._preset_desc.setText(
+                "Custom — settings no longer match a named preset."
+            )
+        kinds = queue_media_kinds(self._queue_paths())
+        self._summary.setText(summarize_pipeline(self._options(), queue_kinds=kinds))
+
+    @Slot()
+    def _on_user_option_changed(self) -> None:
+        if self._applying_preset:
+            return
+        self._mark_custom_preset()
+        self._sync_control_enablement()
+        self._update_summary()
 
     @Slot()
     def _on_preset_chosen(self) -> None:
@@ -690,33 +1019,31 @@ class MainWindow(QMainWindow):
             grid.takeAt(0)
 
     def _layout_metrics(self) -> tuple[int, int, int, bool]:
-        """Return (check_cols, setting_cols, btn_cols, compact_height)."""
+        """Return (check_cols, setting_cols, preview_cols, compact_height)."""
         w = self.width()
         h = self.height()
         short = h < 700
-        # Labeled setting rows need width — never pack more than 2 across.
         if w < 560:
             check_cols = 1 if not short else 2
             setting_cols = 1
-            btn_cols = 2
+            preview_cols = 2
         elif w < 780:
             check_cols = 2
             setting_cols = 2
-            btn_cols = 3
+            preview_cols = 2
         else:
-            check_cols = 3
+            check_cols = 2
             setting_cols = 2
-            btn_cols = 5 if short else 3
-        return check_cols, setting_cols, btn_cols, short
+            preview_cols = 4 if short else 2
+        return check_cols, setting_cols, preview_cols, short
 
     def _reflow_layout(self, *, force: bool = False) -> None:
-        check_cols, setting_cols, btn_cols, short = self._layout_metrics()
-        key = (check_cols, setting_cols, btn_cols, short)
+        check_cols, setting_cols, preview_cols, short = self._layout_metrics()
+        key = (check_cols, setting_cols, preview_cols, short)
         if not force and key == self._layout_key:
             return
         self._layout_key = key
 
-        self._honesty.setText(HONESTY_SHORT if short else HONESTY)
         self._root_layout.setSpacing(4 if short else 8)
         self._root_layout.setContentsMargins(
             6 if short else 8,
@@ -737,10 +1064,16 @@ class MainWindow(QMainWindow):
                 for i, row in enumerate(setting_rows):
                     settings_grid.addWidget(row, i // setting_cols, i % setting_cols)
 
-        self._clear_grid(self._run_grid)
-        for i, btn in enumerate(self._action_btns):
+        self._clear_grid(self._file_btns_grid)
+        file_cols = 3 if self.width() >= 560 else 1
+        for i, btn in enumerate(self._file_btns):
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self._run_grid.addWidget(btn, i // btn_cols, i % btn_cols)
+            self._file_btns_grid.addWidget(btn, i // file_cols, i % file_cols)
+
+        self._clear_grid(self._preview_grid)
+        for i, btn in enumerate(self._preview_btns):
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._preview_grid.addWidget(btn, i // preview_cols, i % preview_cols)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -783,7 +1116,7 @@ class MainWindow(QMainWindow):
         return Path(item.text())
 
     def start(self) -> None:
-        paths = [Path(self.list.item(i).text()) for i in range(self.list.count())]
+        paths = self._queue_paths()
         if not paths:
             QMessageBox.warning(self, "Nothing to do", "Add media files first.")
             return
@@ -832,7 +1165,7 @@ class MainWindow(QMainWindow):
 
         self.preview_btn.setEnabled(False)
         self.run_btn.setEnabled(False)
-        self.preview_status.setText(f"A/B: building preview for {path.name}…")
+        self.preview_status.setText(f"Building preview for {path.name}…")
         self.log.append(f"A/B preview: {path.name}")
 
         opts = self._options()
@@ -866,7 +1199,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.toggle_btn.setText("Playing: Processed")
         self.preview_status.setText(
-            f"A/B ready: {result.start_sec:.1f}s–"
+            f"Ready: {result.start_sec:.1f}s–"
             f"{result.start_sec + result.duration_sec:.1f}s @ {result.sample_rate} Hz"
             f"  |  {result.description}"  # type: ignore[attr-defined]
         )

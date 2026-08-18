@@ -69,6 +69,7 @@ class PresetProfile:
 
     id: PresetId
     label: str
+    description: str
     repair_audio: bool
     repair_video: bool
     upconvert_audio: bool
@@ -100,6 +101,9 @@ _PRESETS: dict[str, PresetProfile] = {
     "listen-better": PresetProfile(
         id="listen-better",
         label="Listen better",
+        description=(
+            "Cleans up lossy audio, expands to 24-bit, mild EQ and stereo width."
+        ),
         repair_audio=True,
         repair_video=False,
         upconvert_audio=True,
@@ -124,6 +128,7 @@ _PRESETS: dict[str, PresetProfile] = {
     "rescue-video": PresetProfile(
         id="rescue-video",
         label="Rescue video",
+        description="Fix broken video and A/V sync; light audio cleanup.",
         repair_audio=True,
         repair_video=True,
         upconvert_audio=True,
@@ -150,6 +155,7 @@ _PRESETS: dict[str, PresetProfile] = {
     "archive-remux": PresetProfile(
         id="archive-remux",
         label="Archive remux",
+        description="Copy/remux only — no repair, upconvert, or sweetening.",
         repair_audio=False,
         repair_video=False,
         upconvert_audio=False,
@@ -176,6 +182,7 @@ _PRESETS: dict[str, PresetProfile] = {
     "master-mkv": PresetProfile(
         id="master-mkv",
         label="Master MKV",
+        description="Full repair and lossless video (FFV1); unsweetened master.",
         repair_audio=True,
         repair_video=True,
         upconvert_audio=True,
@@ -202,6 +209,9 @@ _PRESETS: dict[str, PresetProfile] = {
     "immersive-listen": PresetProfile(
         id="immersive-listen",
         label="Immersive listen",
+        description=(
+            "Repair and upconvert; binaural immersion and headphone crossfeed."
+        ),
         repair_audio=True,
         repair_video=False,
         upconvert_audio=True,
@@ -245,6 +255,7 @@ def preset_settings(preset_id: str) -> dict[str, Any]:
     data = asdict(p)
     data.pop("id")
     data.pop("label")
+    data.pop("description", None)
     return data
 
 
