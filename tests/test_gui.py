@@ -10,7 +10,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+try:
+    from PySide6.QtWidgets import QApplication  # noqa: E402
+except ImportError as exc:
+    pytest.skip(f"PySide6/Qt not usable: {exc}", allow_module_level=True)
 
 from upconvert_all.ml_upscaler import ml_available  # noqa: E402
 from upconvert_all.presets import (  # noqa: E402
