@@ -149,7 +149,12 @@ class PreviewWorker(QObject):
 def _wrap_label(text: str) -> QLabel:
     lab = QLabel(text)
     lab.setWordWrap(True)
-    lab.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+    # Minimum (not Maximum) vertical policy: a word-wrapped label must keep at
+    # least the height its wrapped text needs, otherwise a tight layout shrinks
+    # it below that height and the text collides with the widget beneath it.
+    sp = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+    sp.setHeightForWidth(True)
+    lab.setSizePolicy(sp)
     return lab
 
 
@@ -333,8 +338,18 @@ class MainWindow(QMainWindow):
         self._layout_key: tuple | None = None
         self._applying_preset = False
 
+        # The whole form lives inside one outer scroll area so a short window
+        # never forces sections to overlap: when content does not fit, a single
+        # scrollbar appears instead of colliding text/controls.
+        outer_scroll = QScrollArea()
+        outer_scroll.setWidgetResizable(True)
+        outer_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        outer_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         root = QWidget()
-        self.setCentralWidget(root)
+        outer_scroll.setWidget(root)
+        self.setCentralWidget(outer_scroll)
         self._root_layout = QVBoxLayout(root)
         self._root_layout.setSpacing(8)
         self._root_layout.setContentsMargins(8, 8, 8, 8)
@@ -728,16 +743,12 @@ class MainWindow(QMainWindow):
             (self._out_nested_checks_grid, self._out_nested_checks, self._out_settings_grid, self._out_setting_rows),
         )
 
-        opts_scroll = QScrollArea()
-        opts_scroll.setWidgetResizable(True)
-        opts_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        opts_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        opts_scroll.setWidget(opts_inner)
-        opts_scroll.setMinimumHeight(160)
-        opts_scroll.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        # Options flow directly into the outer scroll area (no nested scroll):
+        # let the section size to its content so nothing is clipped or overlaps.
+        opts_inner.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum
         )
-        self._root_layout.addWidget(opts_scroll, stretch=3)
+        self._root_layout.addWidget(opts_inner)
 
         for chk in self._checkboxes:
             chk.toggled.connect(self._on_user_option_changed)
